@@ -321,9 +321,201 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            point_cloud=pcd)
     return scene_info
 
+def init_scannetpp_pcd(init_type, path, num_pts, nerf_normalization):
 
+    if init_type == "sfm":
+        ply_path = os.path.join(path, "colmap/points3D.ply")
+        bin_path = os.path.join(path, "colmap/points3D.bin")
+        txt_path = os.path.join(path, "colmap/points3D.txt")
+        if not os.path.exists(ply_path):
+            print(
+                "Converting point3d to .ply, will happen only the first time you open the scene."
+            )
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+
+    elif init_type == "random":
+        ply_path = os.path.join(path, "random.ply")
+        print(f"Generating random point cloud ({num_pts})...")
+
+        xyz = np.random.random((num_pts, 3)) * nerf_normalization["radius"] * 3 * 2 - (
+            nerf_normalization["radius"] * 3
+        )
+
+        num_pts = xyz.shape[0]
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(
+            points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3))
+        )
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+
+    else:
+        print("Please specify a correct init_type: random or sfm")
+        exit(0)
+
+    return ply_path
+
+def readCamerasInstantNGPTransforms(
+    transforms_file: str, images_folder: str, test: bool
+):
+    cam_infos = []
+
+    with open(transforms_file) as json_file:
+        contents = json.load(json_file)
+
+        if "camera_model" in contents and contents["camera_model"] != "PINHOLE":
+            assert False, "Only PINHOLE camera model supported!"
+
+        if contents["k1"] != 0 or contents["k2"] != 0:
+            assert False, "Only undistorted datasets supported!"
+
+        fx = contents["fl_x"]
+        fy = contents["fl_y"]
+        w = contents["w"]
+        h = contents["h"]
+
+        if test and "test_frames" in contents:
+            frames = contents["test_frames"]
+        else:
+            frames = contents["frames"]
+
+        for idx, frame in enumerate(frames):
+
+            # NeRF 'transform_matrix' is a camera-to-world transform
+            c2w = np.array(frame["transform_matrix"])
+            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+            c2w[:3, 1:3] *= -1
+
+            # world coordinate transform: inverse for map colmap gravity guess (-y) to nerfstudio convention (+z)
+            # to use SfM pointcloud
+            # https://github.com/nerfstudio-project/nerfstudio/blob/ec10c49d51cfebc52618ece1221ec4511ac19b67/nerfstudio/data/dataparsers/colmap_dataparser.py#L169
+            c2w = c2w[np.array([1, 0, 2, 3]), :]
+            c2w[2, :] *= -1
+
+            # get the world-to-camera transform and set R, T
+            w2c = np.linalg.inv(c2w)
+            R = np.transpose(
+                w2c[:3, :3]
+            )  # R is stored transposed due to 'glm' in CUDA code
+            T = w2c[:3, 3]
+
+            image_name = frame["file_path"]
+            image_path = os.path.join(images_folder, image_name)
+            image = Image.open(image_path)
+            image = image.convert("RGB")
+
+            assert image.size[0] == w and image.size[1] == h, "Image size mismatch!"
+
+            FovX = focal2fov(fx, w)
+            FovY = focal2fov(fy, h)
+
+            cam_infos.append(
+                CameraInfo(
+                    uid=idx,
+                    R=R,
+                    T=T,
+                    FovY=FovY,
+                    FovX=FovX,
+                    image_path=image_path,
+                    image_name=image_name,
+                    width=w,
+                    height=h,
+                    image=image,
+                )
+            )
+
+        cam_infos = sorted(cam_infos, key=lambda x: x.image_name)
+        return cam_infos
+
+def readScannetppDSLRInfo(path, eval, init_type="sfm"):
+
+    print("Reading train transforms")
+    train_cam_infos = readCamerasInstantNGPTransforms(
+        os.path.join(path, "nerfstudio/transforms_undistorted.json"),
+        os.path.join(path, "undistorted_images"),
+        test=False,
+    )
+
+    print("Reading test transforms")
+    test_cam_infos = readCamerasInstantNGPTransforms(
+        os.path.join(path, "nerfstudio/transforms_undistorted.json"),
+        os.path.join(path, "undistorted_images"),
+        test=True,
+    )
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    print(
+        f"Num train cameras: {len(train_cam_infos)}, num test cameras: {len(test_cam_infos)}"
+    )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path = init_scannetpp_pcd(init_type, path, 100_000, nerf_normalization)
+
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+    )
+    return scene_info
+
+
+def readScannetpIphoneInfo(path, eval, llffhold=8, init_type="sfm"):
+
+    cam_infos = readCamerasInstantNGPTransforms(
+        os.path.join(path, "nerfstudio/transforms_undistorted.json"),
+        os.path.join(path, "undistorted_images"),
+        test=False,
+    )
+    if llffhold > 0:
+        # take 1/llffhold of the cameras for testing
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+
+        # take the rest of the cameras for training cameras
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    print(
+        f"Num train cameras: {len(train_cam_infos)}, num test cameras: {len(test_cam_infos)}"
+    )
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    ply_path = init_scannetpp_pcd(init_type, path, 100_000, nerf_normalization)
+
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+    )
+    return scene_info
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender": readNerfSyntheticInfo,
+    "ScannetppDSLR": readScannetppDSLRInfo,
+    "ScannetppIPhone": readScannetpIphoneInfo,
+    # "ScannetV2": readScannetV2Info,
 }
